@@ -1,0 +1,103 @@
+// mzi_tile.va
+// 2×2 Mach-Zehnder Interferometer tile — photonic dot-product unit
+// Maps to PDK cell MZI_2x2 (60×120 µm).
+// Implements: ADD, SUB, MUL, DIV on optical amplitudes.
+// Extracted from analog_a_engine.py :: MZITile  +  pdk_gds_tapout.py :: MZI_2x2
+//
+// Operation encoding (op_sel):
+//   0 = MUL  (coherent interference: U·E_A ⊗ E_B)
+//   1 = ADD  (E_A + E_B, power-normalised)
+//   2 = SUB  (E_A − E_B, power-normalised)
+//   3 = DIV  (E_A / E_B, guarded)
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+module mzi_tile(in0, in1, out0, out1, phi0, phi1);
+
+    // ── Ports ─────────────────────────────────────────────────────────────────
+    inout  electrical in0, in1;       // optical input amplitudes
+    output electrical out0, out1;     // optical output amplitudes
+    input  electrical phi0, phi1;     // thermo-optic phase shifters (M1 heater)
+
+    // ── MZI physical parameters ───────────────────────────────────────────────
+    parameter real mzi_loss_dB      = 0.35   from (0:inf);   // per unit length
+    parameter real insertion_loss_dB = 1.2   from (0:inf);   // total IL
+    parameter real coupling_ratio   = 0.5    from (0:1];     // 50:50 splitter
+    parameter real path_imbalance_um = 0.0;                  // arm length Δ (µm)
+    parameter integer phase_bits    = 8      from [4:16];    // DAC resolution
+
+    // ── SiPh compensation (per-tile) ─────────────────────────────────────────
+    parameter real alpha_phase      = 0.0;   // rad  phase bias
+    parameter real beta_amplitude   = 1.0   from (0:2];
+    parameter real gamma_ppm_K      = 0.0;
+    parameter real delta_nm_offset  = 0.0;
+
+    // ── Operation selector ────────────────────────────────────────────────────
+    parameter integer op_sel        = 0     from [0:3];
+    // 0=MUL, 1=ADD, 2=SUB, 3=DIV
+
+    // ── Branches ─────────────────────────────────────────────────────────────
+    branch (in0)   b_in0;
+    branch (in1)   b_in1;
+    branch (out0)  b_out0;
+    branch (out1)  b_out1;
+    branch (phi0)  b_phi0;
+    branch (phi1)  b_phi1;
+
+    real E_a, E_b, phase0, phase1;
+    real il_lin, coup, cross;
+    real E_arm0, E_arm1, E_out0, E_out1;
+    real phase_comp;
+
+    analog begin
+        // ── Read inputs ───────────────────────────────────────────────────────
+        E_a    = V(b_in0);
+        E_b    = V(b_in1);
+
+        // ── Phase shifter voltages → optical phase (8-bit DAC headroom) ───────
+        phase0  = V(b_phi0) * (`M_PI / 5.0);   // ~π rad at 5 V full-scale
+        phase1  = V(b_phi1) * (`M_PI / 5.0);
+
+        // ── SiPh γ/δ phase compensation ──────────────────────────────────────
+        phase_comp = alpha_phase
+                     + gamma_ppm_K * 1e-6
+                     + delta_nm_offset * 0.01;
+
+        // ── Insertion loss ────────────────────────────────────────────────────
+        il_lin = pow(10.0, -(insertion_loss_dB + mzi_loss_dB) / 20.0)
+                 * beta_amplitude;
+
+        // ── 50:50 beam splitter matrix ────────────────────────────────────────
+        //    [ E_arm0 ]   [ sqrt(κ)    j*sqrt(1-κ) ] [ E_a ]
+        //    [ E_arm1 ] = [ j*sqrt(1-κ)  sqrt(κ)   ] [ E_b ]
+        coup  = sqrt(coupling_ratio);
+        cross = sqrt(1.0 - coupling_ratio);
+
+        E_arm0 = il_lin * ( coup  * E_a * cos(phase_comp)
+                          - cross * E_b * sin(phase_comp + phase0));
+        E_arm1 = il_lin * (-cross * E_a * sin(phase_comp)
+                          + coup  * E_b * cos(phase_comp + phase1));
+
+        // ── Operation execution ───────────────────────────────────────────────
+        if (op_sel == 0) begin           // MUL: coherent product
+            E_out0 = E_arm0 * E_arm1;
+            E_out1 = E_arm0 * E_arm1;
+        end
+        else if (op_sel == 1) begin      // ADD
+            E_out0 = (E_arm0 + E_arm1) * 0.5;
+            E_out1 = (E_arm0 + E_arm1) * 0.5;
+        end
+        else if (op_sel == 2) begin      // SUB
+            E_out0 = (E_arm0 - E_arm1) * 0.5;
+            E_out1 = (E_arm1 - E_arm0) * 0.5;
+        end
+        else begin                       // DIV (guarded)
+            E_out0 = E_arm0 / (E_arm1 + 1e-12);
+            E_out1 = E_arm1 / (E_arm0 + 1e-12);
+        end
+
+        V(b_out0) <+ E_out0;
+        V(b_out1) <+ E_out1;
+    end
+endmodule

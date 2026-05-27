@@ -1,0 +1,214 @@
+// siph_gi3at_proxy.va
+// GI3AT proxy group — one TMR triplet with SiPh α/β/γ/δ compensation
+// One ProxyGroup contains 3 MZI-tile proxies (channels A, B, C).
+// Voting: 2-of-3 Frobenius-norm agreement → pass result downstream.
+// Extracted from analog_a_engine.py :: ProxyGroup + TMRVoter + SiPhCompensation
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-module: SiPh compensation block (α/β/γ/δ channels)
+// ─────────────────────────────────────────────────────────────────────────────
+module siph_compensation(opt_in, opt_out, heater, fault_in);
+
+    inout  electrical opt_in;     // optical field in
+    output electrical opt_out;    // compensated field out
+    input  electrical heater;     // γ thermal correction drive
+    input  electrical fault_in;   // fault fraction signal (0–1 V)
+
+    parameter real alpha_phase    = 0.0;           // rad  DC phase bias
+    parameter real beta_amplitude = 1.0  from (0:2];
+    parameter real gamma_max_ppm  = 50.0 from (0:inf);
+    parameter real delta_max_nm   = 20.0 from (0:inf);
+    parameter real gamma_gain     = 30.0;          // ppm per fault unit
+    parameter real delta_gain     = 10.0;          // nm  per fault unit
+
+    branch (opt_in)   b_in;
+    branch (opt_out)  b_out;
+    branch (heater)   b_heat;
+    branch (fault_in) b_fault;
+
+    real E_in, fault_frac, gamma_active, delta_active, phase_total;
+
+    analog begin
+        E_in       = V(b_in);
+        fault_frac = V(b_fault);    // 0 = no fault, 1 = full fault
+
+        // γ/δ auto-heal boost (clamped to max)
+        gamma_active = min(gamma_max_ppm, fault_frac * gamma_gain
+                           + V(b_heat) * 5.0);
+        delta_active = min(delta_max_nm,  fault_frac * delta_gain);
+
+        // Total compensating phase
+        phase_total = alpha_phase
+                      + gamma_active * 1e-6    // thermal ppm → rad
+                      + delta_active * 0.01;   // fab offset → rad
+
+        V(b_out) <+ E_in * beta_amplitude * cos(phase_total);
+    end
+endmodule
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-module: single proxy element (wraps one MZI tile)
+// ─────────────────────────────────────────────────────────────────────────────
+module proxy_element(in_a, in_b, result_out, fault_flag, comp_in);
+
+    inout  electrical in_a, in_b;   // matrix operand inputs (optical amplitudes)
+    output electrical result_out;   // computed optical result
+    output electrical fault_flag;   // 1 V = this proxy is FAULT/HEALING
+    input  electrical comp_in;      // SiPh compensation drive
+
+    parameter real    agree_thresh  = 1.0e-4  from (0:1];
+    parameter integer op_sel        = 0       from [0:3];
+    parameter integer tile_seed     = 1;      // tile identity (phase LUT seed)
+
+    branch (in_a)       b_a;
+    branch (in_b)       b_b;
+    branch (result_out) b_res;
+    branch (fault_flag) b_fault;
+    branch (comp_in)    b_comp;
+
+    real E_a, E_b, E_res, comp_gain;
+    real phase_lut;    // pseudo-random phase from tile identity
+
+    analog begin
+        E_a       = V(b_a);
+        E_b       = V(b_b);
+        comp_gain = V(b_comp);
+
+        // Tile-specific phase from seed (simulates Clements decomposition LUT)
+        phase_lut = `M_PI * (tile_seed % 256) / 256.0;
+
+        if (op_sel == 0)       // MUL
+            E_res = E_a * E_b * comp_gain * cos(phase_lut);
+        else if (op_sel == 1)  // ADD
+            E_res = (E_a + E_b) * 0.5 * comp_gain;
+        else if (op_sel == 2)  // SUB
+            E_res = (E_a - E_b) * 0.5 * comp_gain;
+        else                   // DIV
+            E_res = E_a / (E_b + 1e-12) * comp_gain;
+
+        V(b_res)   <+ E_res;
+        V(b_fault) <+ 0.0;   // nominal: healthy
+    end
+endmodule
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Top module: GI3AT proxy group (3 proxies + TMR voter + SiPh heal)
+// ─────────────────────────────────────────────────────────────────────────────
+module siph_gi3at_proxy(in_a, in_b,
+                        voted_out,
+                        vote_status,
+                        fault_bus,
+                        heater_drive);
+
+    // ── Ports ─────────────────────────────────────────────────────────────────
+    inout  electrical in_a;        // matrix operand A (optical amplitude)
+    inout  electrical in_b;        // matrix operand B
+    output electrical voted_out;   // TMR-voted result
+    output electrical vote_status; // 0=AGREE_ALL, 1=AGREE_2OF3, 2=SPLIT, 3=HALT
+    output electrical fault_bus;   // MQTT fault level: 0=ok 1=warn 2=halt
+    input  electrical heater_drive; // γ thermal compensation input
+
+    // ── GI3AT group parameters ────────────────────────────────────────────────
+    parameter real    agree_threshold = 1.0e-4 from (0:1];
+    parameter integer op_sel          = 0      from [0:3];   // 0=MUL 1=ADD 2=SUB 3=DIV
+    parameter integer halt_on_disagree = 1     from [0:1];
+
+    // ── Per-proxy SiPh compensation ───────────────────────────────────────────
+    parameter real alpha_A = 0.0;  parameter real beta_A = 1.0;
+    parameter real alpha_B = 0.0;  parameter real beta_B = 1.0;
+    parameter real alpha_C = 0.0;  parameter real beta_C = 1.0;
+    parameter real gamma_ppm = 0.0;
+    parameter real delta_nm  = 0.0;
+
+    // ── Internal electrical nodes ─────────────────────────────────────────────
+    electrical res_A, res_B, res_C;    // per-proxy results
+    electrical fault_A, fault_B, fault_C;
+    electrical comp_node;
+
+    // ── Branches ─────────────────────────────────────────────────────────────
+    branch (voted_out)   b_voted;
+    branch (vote_status) b_vstatus;
+    branch (fault_bus)   b_fbus;
+    branch (heater_drive) b_heat;
+    branch (comp_node)   b_comp;
+
+    // ── Proxy instances ───────────────────────────────────────────────────────
+    proxy_element pA(.in_a(in_a), .in_b(in_b), .result_out(res_A),
+                     .fault_flag(fault_A), .comp_in(comp_node));
+    defparam pA.op_sel = op_sel;  defparam pA.tile_seed = 101;
+
+    proxy_element pB(.in_a(in_a), .in_b(in_b), .result_out(res_B),
+                     .fault_flag(fault_B), .comp_in(comp_node));
+    defparam pB.op_sel = op_sel;  defparam pB.tile_seed = 202;
+
+    proxy_element pC(.in_a(in_a), .in_b(in_b), .result_out(res_C),
+                     .fault_flag(fault_C), .comp_in(comp_node));
+    defparam pC.op_sel = op_sel;  defparam pC.tile_seed = 303;
+
+    // ── TMR voter analog block ────────────────────────────────────────────────
+    real E_a, E_b, E_c, diff_ab, diff_ac, diff_bc;
+    real norm_ref, agreed_val, fault_frac;
+
+    analog begin
+        // Compensation drive to proxies
+        V(b_comp) <+ V(b_heat) + gamma_ppm * 1e-6 + delta_nm * 0.01;
+
+        E_a = V(res_A);
+        E_b = V(res_B);
+        E_c = V(res_C);
+
+        norm_ref = max(abs(E_a), 1e-9);
+        diff_ab  = abs(E_a - E_b) / norm_ref;
+        diff_ac  = abs(E_a - E_c) / norm_ref;
+        diff_bc  = abs(E_b - E_c) / norm_ref;
+
+        // ── 2-of-3 voting ─────────────────────────────────────────────────────
+        if (diff_ab < agree_threshold && diff_ac < agree_threshold
+                                      && diff_bc < agree_threshold) begin
+            // AGREE_ALL — all three match
+            agreed_val = E_a;
+            V(b_vstatus) <+ 0.0;
+            V(b_fbus)    <+ 0.0;
+
+        end else if (diff_ab < agree_threshold) begin
+            // A and B agree — C is outlier
+            agreed_val = (E_a + E_b) * 0.5;
+            V(b_vstatus) <+ 1.0;
+            V(b_fbus)    <+ 0.0;    // soft — no MQTT fault
+
+        end else if (diff_ac < agree_threshold) begin
+            // A and C agree — B is outlier
+            agreed_val = (E_a + E_c) * 0.5;
+            V(b_vstatus) <+ 1.0;
+            V(b_fbus)    <+ 0.0;
+
+        end else if (diff_bc < agree_threshold) begin
+            // B and C agree — A is outlier
+            agreed_val = (E_b + E_c) * 0.5;
+            V(b_vstatus) <+ 1.0;
+            V(b_fbus)    <+ 0.0;
+
+        end else begin
+            // SPLIT or DISAGREE_ALL → HALT signal + MQTT fault bus
+            agreed_val = 0.0;
+            V(b_vstatus) <+ 3.0;
+            if (halt_on_disagree)
+                V(b_fbus) <+ 2.0;   // 2 V = UNRECOVERABLE ERROR on MQTT bus
+            else
+                V(b_fbus) <+ 1.0;   // 1 V = warn/split
+
+            // γ/δ auto-heal: boost compensation on disagreement
+            fault_frac = 1.0;
+            V(b_comp)  <+ V(b_heat)
+                          + min(50.0, fault_frac * 30.0) * 1e-6  // γ boost
+                          + min(20.0, fault_frac * 10.0) * 0.01; // δ boost
+        end
+
+        V(b_voted) <+ agreed_val;
+    end
+endmodule

@@ -1,0 +1,65 @@
+// vcsel_emitter.va
+// VCSEL 850 nm single-aperture emitter — butt-coupled to SiN waveguide
+// Extracted from vcsel_shg_thg.py :: VCSELEmitter
+// Discipline convention: V() = optical amplitude (sqrt(W)), I() = power (W)
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+module vcsel_emitter(anode, cathode, optical_out, heater);
+    inout  electrical anode, cathode;
+    output electrical optical_out;
+    input  electrical heater;
+
+    // ── Process / device parameters ──────────────────────────────────────────
+    parameter real wavelength_nm  = 850.0   from (400:2000];   // nm
+    parameter real threshold_mA   = 1.5     from (0:inf);      // threshold current
+    parameter real slope_eff_WA   = 0.45    from (0:1];        // W/A slope efficiency
+    parameter real series_ohm     = 45.0    from (0:inf);      // series resistance Ω
+    parameter real coupling_eff   = 0.72    from (0:1];        // fiber/WG coupling
+    parameter real dnudt_GHz_K    = -0.06;                     // thermal chirp GHz/K
+    parameter real T_nom_K        = 300.0   from (0:inf);      // nominal temperature
+
+    // ── SiPh compensation channels (α/β from GI3AT engine) ──────────────────
+    parameter real alpha_phase    = 0.0;    // rad  — DC phase bias
+    parameter real beta_amplitude = 1.0    from (0:2];         // insertion loss norm
+
+    // ── Branches ─────────────────────────────────────────────────────────────
+    branch (anode,   cathode)   b_laser;
+    branch (anode,   cathode)   b_series;
+    branch (optical_out)        b_opt;
+    branch (heater)             b_heat;
+
+    // ── Internal variables ───────────────────────────────────────────────────
+    real I_bias, P_out_mW, E_amp, T_K, lambda_shifted;
+
+    analog begin
+        // Bias current (above threshold → lasing)
+        I_bias = I(b_laser) * 1e3;  // A → mA
+
+        // Junction voltage (laser diode approximation)
+        V(b_series) <+ series_ohm * I(b_laser);
+
+        // Temperature from heater power
+        T_K = T_nom_K + V(b_heat) * 10.0;  // 10 K/V heater sensitivity
+
+        // Thermal wavelength red-shift: ~0.06 nm/K
+        lambda_shifted = wavelength_nm + 0.06 * (T_K - T_nom_K);
+
+        // Output power (mW): slope above threshold
+        if (I_bias > threshold_mA)
+            P_out_mW = slope_eff_WA * (I_bias - threshold_mA) * 1e-3 * 1e3;
+        else
+            P_out_mW = 0.0;
+
+        // Complex amplitude into waveguide: E = sqrt(P * coupling) * alpha/beta
+        E_amp = sqrt(P_out_mW * 1e-3 * coupling_eff) * beta_amplitude;
+
+        // Phase-bias (α channel) applied to output field
+        V(b_opt) <+ E_amp * cos(alpha_phase);
+
+        // ── $strobe diagnostic ───────────────────────────────────────────────
+        $strobe("VCSEL λ=%.1fnm  I=%.2fmA  P=%.3fmW  E=%.4f√W",
+                lambda_shifted, I_bias, P_out_mW, E_amp);
+    end
+endmodule

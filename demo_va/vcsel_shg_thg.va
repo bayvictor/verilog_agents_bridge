@@ -1,0 +1,123 @@
+// vcsel_shg_thg.va
+// Full VCSEL + SHG (χ²) + THG (χ³ cascaded) integrated PIC cell
+// GDS cell: VCSEL_SHG_THG_v1   Footprint: 60×200 µm
+// Extracted from vcsel_shg_thg.py :: VCSELFreqMultiplierCell
+//
+// Signal chain:
+//   VCSEL (850nm) → Grating Coupler → χ² PPLN SHG → 425nm
+//                                    → χ³ SiN ring  → 283nm
+//                                    → WDM splitter → 3 output ports
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+module vcsel_shg_thg(anode, cathode,
+                     out_850nm, out_425nm, out_283nm,
+                     heater_p, heater_n, bias_pad);
+
+    // ── Port declarations ─────────────────────────────────────────────────────
+    inout  electrical anode, cathode;          // VCSEL bias
+    output electrical out_850nm;               // fundamental residual
+    output electrical out_425nm;               // SHG output  (χ², λ/2)
+    output electrical out_283nm;               // THG output  (χ³, λ/3)
+    input  electrical heater_p, heater_n;      // thermo-optic phase trim
+    input  electrical bias_pad;                // DC bias return
+
+    // ── VCSEL parameters ──────────────────────────────────────────────────────
+    parameter real vcsel_lambda_nm  = 850.0   from (400:2000];
+    parameter real threshold_mA     = 1.5     from (0:inf);
+    parameter real slope_eff_WA     = 0.45    from (0:1];
+    parameter real series_ohm       = 45.0    from (0:inf);
+    parameter real coupling_eff_gc  = 0.72    from (0:1];     // grating coupler
+
+    // ── SHG section (χ², PPLN MgO on SOI) ────────────────────────────────────
+    parameter real shg_length_mm    = 5.0     from (0:inf);
+    parameter real shg_chi2_pm_V    = 20.0    from (0:inf);   // pm/V effective
+    parameter real shg_period_um    = 3.04    from (0:inf);   // QPM poling period
+    parameter real shg_loss_dB_cm   = 0.8     from (0:inf);
+    parameter real shg_eta_norm     = 300.0e-4 from (0:inf);  // %/W/mm²
+
+    // ── THG ring (χ³, Si₃N₄ micro-ring) ──────────────────────────────────────
+    parameter real thg_radius_um    = 10.0    from (0:inf);
+    parameter real thg_Q_loaded     = 20000.0 from (0:inf);
+    parameter real thg_chi3_m2_V2   = 2.4e-19 from (0:inf);
+    parameter real thg_eta_cas      = 1.0e-4  from (0:inf);   // cascaded SFG η
+
+    // ── WDM splitter ──────────────────────────────────────────────────────────
+    parameter real wdm_loss_dB      = 0.8     from (0:inf);
+    parameter real wdm_xtalk_dB     = -30.0;
+
+    // ── SiPh α/β/γ/δ compensation ────────────────────────────────────────────
+    parameter real alpha_phase      = 0.0;     // rad
+    parameter real beta_amplitude   = 1.0     from (0:2];
+    parameter real gamma_ppm_K      = 0.0;     // thermal drift correction
+    parameter real delta_nm_offset  = 0.0;     // fab width offset
+
+    // ── Branches ─────────────────────────────────────────────────────────────
+    branch (anode,    cathode)    b_vcsel;
+    branch (heater_p, heater_n)  b_heater;
+    branch (out_850nm)            b_850;
+    branch (out_425nm)            b_425;
+    branch (out_283nm)            b_283;
+
+    // ── Internal signals ──────────────────────────────────────────────────────
+    real I_mA, P_pump_mW, E_pump;
+    real P_shg_mW, P_res_mW, loss_lin;
+    real P_thg_mW, finesse, F_enh;
+    real eta_wdm, xt;
+    real T_delta, phase_thermal, phase_fab;
+
+    analog begin
+        // ── 1. VCSEL bias & output ───────────────────────────────────────────
+        I_mA = I(b_vcsel) * 1e3;
+        V(b_vcsel) <+ series_ohm * I(b_vcsel);
+
+        if (I_mA > threshold_mA)
+            P_pump_mW = slope_eff_WA * (I_mA - threshold_mA) * 1e-3 * 1e3;
+        else
+            P_pump_mW = 0.0;
+
+        E_pump = sqrt(P_pump_mW * 1e-3 * coupling_eff_gc);
+
+        // ── 2. SHG conversion (χ²) ───────────────────────────────────────────
+        // P_2w = η_norm × L² × P_w²   (waveguide SHG standard formula)
+        loss_lin  = pow(10.0, -shg_loss_dB_cm * shg_length_mm * 0.1 / 20.0);
+        P_shg_mW  = shg_eta_norm * shg_length_mm * shg_length_mm
+                    * (P_pump_mW * 1e-3) * (P_pump_mW * 1e-3) * 1e3;
+        P_shg_mW  = P_shg_mW * loss_lin;
+        if (P_shg_mW > P_pump_mW * 0.85)
+            P_shg_mW = P_pump_mW * 0.85;   // physical clamp
+        P_res_mW  = P_pump_mW - P_shg_mW;
+        if (P_res_mW < 0.0) P_res_mW = 0.0;
+
+        // ── 3. THG via cascaded χ²:χ² in SiN ring ────────────────────────────
+        // Finesse = Q × FSR / ν_res  (simplified using ring geometry)
+        finesse   = thg_Q_loaded / (2.0 * `M_PI);
+        F_enh     = finesse / `M_PI;
+        P_thg_mW  = thg_eta_cas * F_enh
+                    * (P_res_mW * 1e-3) * (P_shg_mW * 1e-3) * 1e3;
+        if (P_thg_mW > 0.15 * min(P_res_mW, P_shg_mW))
+            P_thg_mW = 0.15 * min(P_res_mW, P_shg_mW);
+
+        // ── 4. SiPh γ/δ thermal + fab phase compensation ─────────────────────
+        T_delta      = V(b_heater) * 10.0;          // K from heater voltage
+        phase_thermal = gamma_ppm_K * T_delta * 1e-6;
+        phase_fab     = delta_nm_offset * 0.01;
+
+        // ── 5. WDM demux + output ports ──────────────────────────────────────
+        eta_wdm = pow(10.0, -wdm_loss_dB / 20.0);
+        xt      = pow(10.0, wdm_xtalk_dB / 20.0);
+
+        V(b_850) <+ beta_amplitude * eta_wdm
+                    * sqrt(P_res_mW * 1e-3)
+                    * cos(alpha_phase + phase_thermal + phase_fab);
+
+        V(b_425) <+ beta_amplitude * eta_wdm
+                    * sqrt(P_shg_mW * 1e-3)
+                    * cos(alpha_phase + phase_thermal);
+
+        V(b_283) <+ beta_amplitude * eta_wdm
+                    * sqrt(P_thg_mW * 1e-3)
+                    * cos(alpha_phase);
+    end
+endmodule
